@@ -1,6 +1,7 @@
 {
   "buildCommand": "cd client && npm install && npm run build",
   "outputDirectory": "client/dist",
+  "installCommand": "npm install && cd client && npm install",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
     { "source": "/uploads/(.*)", "destination": "/api" },
@@ -8,7 +9,8 @@
   ],
   "functions": {
     "api/index.js": {
-      "includeFiles": "server/**"
+      "includeFiles": "server/**",
+      "maxDuration": 30
     }
   }
 }
