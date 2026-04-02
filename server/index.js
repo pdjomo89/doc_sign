@@ -51,6 +51,11 @@ if (!isVercel) {
   app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 }
 
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, vercel: isVercel, time: new Date().toISOString() });
+});
+
 // Serve uploaded PDFs from database on Vercel
 app.get('/uploads/:filename', (req, res) => {
   if (!isVercel) return res.status(404).end();
