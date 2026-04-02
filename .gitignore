@@ -1,0 +1,9 @@
+node_modules/
+dist/
+server/uploads/*
+!server/uploads/.gitkeep
+server/docsign.db
+server/docsign.db-shm
+server/docsign.db-wal
+server/.env
+*.log
