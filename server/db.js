@@ -63,7 +63,10 @@ if (process.env.VERCEL) {
         dbInstance = new SQL.Database();
       }
       dbInstance.run('PRAGMA foreign_keys = ON;');
-      dbInstance.run(SCHEMA);
+      // sql.js run() only executes one statement, so split and run each
+      SCHEMA.split(';').map(s => s.trim()).filter(Boolean).forEach(stmt => {
+        dbInstance.run(stmt + ';');
+      });
       return dbInstance;
     })();
 
@@ -121,7 +124,9 @@ if (process.env.VERCEL) {
   };
 } else {
   // Local development: use better-sqlite3 (fast, native)
-  const Database = require('better-sqlite3');
+  // Use dynamic require so Vercel's bundler won't try to include native module
+  const moduleName = 'better-sqlite3';
+  const Database = require(moduleName);
   db = new Database(path.join(__dirname, 'docsign.db'));
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
