@@ -10,18 +10,34 @@ const db = require('./db');
 const { sendSigningRequest, sendCompletionNotice } = require('./email');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
 
 app.use(cors());
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.json({ limit: '25mb' }));
 
-const storage = multer.diskStorage({
-  destination: path.join(__dirname, 'uploads'),
-  filename: (req, file, cb) => {
-    cb(null, `${uuidv4()}-${file.originalname}`);
-  },
-});
+// Middleware to initialize async DB on Vercel
+if (db._isAsync) {
+  app.use(async (req, res, next) => {
+    try {
+      await db.initDb();
+      next();
+    } catch (err) {
+      res.status(500).json({ error: 'Database initialization failed' });
+    }
+  });
+}
+
+const isVercel = !!process.env.VERCEL;
+
+// File storage: disk for local, memory for Vercel
+const storage = isVercel
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: path.join(__dirname, 'uploads'),
+      filename: (req, file, cb) => {
+        cb(null, `${uuidv4()}-${file.originalname}`);
+      },
+    });
+
 const upload = multer({
   storage,
   fileFilter: (req, file, cb) => {
@@ -29,6 +45,26 @@ const upload = multer({
     else cb(new Error('Only PDF files are allowed'));
   },
   limits: { fileSize: 20 * 1024 * 1024 },
+});
+
+if (!isVercel) {
+  app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+}
+
+// Serve uploaded PDFs from database on Vercel
+app.get('/uploads/:filename', (req, res) => {
+  if (!isVercel) return res.status(404).end();
+
+  // Find the document by filename pattern
+  const docs = db.prepare('SELECT file_data, filename FROM documents WHERE original_path LIKE ?').all(`%${req.params.filename}%`);
+  if (docs.length > 0 && docs[0].file_data) {
+    const buffer = Buffer.from(docs[0].file_data, 'base64');
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Disposition', `inline; filename="${docs[0].filename}"`);
+    res.send(buffer);
+  } else {
+    res.status(404).json({ error: 'File not found' });
+  }
 });
 
 // Upload document and create signing request
@@ -42,10 +78,21 @@ app.post('/api/documents', upload.single('file'), async (req, res) => {
     if (!parsedSigners.length) return res.status(400).json({ error: 'At least one signer is required' });
 
     const docId = uuidv4();
-    db.prepare(`
-      INSERT INTO documents (id, title, filename, original_path, owner_name, owner_email, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    `).run(docId, title, req.file.originalname, req.file.path, ownerName, ownerEmail);
+    const fileId = `${uuidv4()}-${req.file.originalname}`;
+
+    if (isVercel) {
+      // Store file as base64 in database
+      const fileData = req.file.buffer.toString('base64');
+      db.prepare(`
+        INSERT INTO documents (id, title, filename, original_path, file_data, owner_name, owner_email, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+      `).run(docId, title, req.file.originalname, fileId, fileData, ownerName, ownerEmail);
+    } else {
+      db.prepare(`
+        INSERT INTO documents (id, title, filename, original_path, owner_name, owner_email, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+      `).run(docId, title, req.file.originalname, req.file.path, ownerName, ownerEmail);
+    }
 
     const insertSigner = db.prepare(`
       INSERT INTO signers (id, document_id, name, email, token, status, sign_order)
@@ -88,7 +135,7 @@ app.post('/api/documents', upload.single('file'), async (req, res) => {
 
 // Get all documents
 app.get('/api/documents', (req, res) => {
-  const docs = db.prepare('SELECT * FROM documents ORDER BY created_at DESC').all();
+  const docs = db.prepare('SELECT id, title, filename, original_path, signed_path, owner_name, owner_email, status, created_at, completed_at FROM documents ORDER BY created_at DESC').all();
   const result = docs.map(doc => {
     const signers = db.prepare('SELECT id, name, email, status, signed_at, sign_order FROM signers WHERE document_id = ? ORDER BY sign_order').all(doc.id);
     return { ...doc, signers };
@@ -98,7 +145,7 @@ app.get('/api/documents', (req, res) => {
 
 // Get single document
 app.get('/api/documents/:id', (req, res) => {
-  const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(req.params.id);
+  const doc = db.prepare('SELECT id, title, filename, original_path, signed_path, owner_name, owner_email, status, created_at, completed_at FROM documents WHERE id = ?').get(req.params.id);
   if (!doc) return res.status(404).json({ error: 'Document not found' });
 
   const signers = db.prepare('SELECT id, name, email, token, status, signed_at, sign_order FROM signers WHERE document_id = ? ORDER BY sign_order').all(doc.id);
@@ -111,10 +158,14 @@ app.get('/api/sign/:token', (req, res) => {
   if (!signer) return res.status(404).json({ error: 'Invalid signing link' });
 
   const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(signer.document_id);
+  const pdfUrl = isVercel
+    ? `/uploads/${doc.original_path}`
+    : `/uploads/${path.basename(doc.original_path)}`;
+
   res.json({
     document: { id: doc.id, title: doc.title, filename: doc.filename, owner_name: doc.owner_name, status: doc.status },
     signer: { id: signer.id, name: signer.name, email: signer.email, status: signer.status },
-    pdfUrl: `/uploads/${path.basename(doc.original_path)}`,
+    pdfUrl,
   });
 });
 
@@ -138,13 +189,18 @@ app.post('/api/sign/:token', async (req, res) => {
     const allSigned = allSigners.every(s => s.status === 'signed' || s.id === signer.id);
 
     if (allSigned) {
-      // Generate the signed PDF with all signatures
-      const pdfBytes = fs.readFileSync(doc.original_path);
+      // Load the original PDF
+      let pdfBytes;
+      if (isVercel && doc.file_data) {
+        pdfBytes = Buffer.from(doc.file_data, 'base64');
+      } else {
+        pdfBytes = fs.readFileSync(doc.original_path);
+      }
+
       const pdfDoc = await PDFDocument.load(pdfBytes);
       const pages = pdfDoc.getPages();
       const lastPage = pages[pages.length - 1];
       const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const { height } = lastPage.getSize();
 
       // Add signature block to last page
       let yPos = 80 + (allSigners.length * 60);
@@ -195,13 +251,22 @@ app.post('/api/sign/:token', async (req, res) => {
       }
 
       const signedPdfBytes = await pdfDoc.save();
-      const signedPath = path.join(__dirname, 'uploads', `signed-${path.basename(doc.original_path)}`);
-      fs.writeFileSync(signedPath, signedPdfBytes);
 
-      db.prepare(`
-        UPDATE documents SET status = 'completed', signed_path = ?, completed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(signedPath, doc.id);
+      if (isVercel) {
+        // Store signed PDF as base64 in database
+        const signedData = Buffer.from(signedPdfBytes).toString('base64');
+        db.prepare(`
+          UPDATE documents SET status = 'completed', signed_data = ?, completed_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(signedData, doc.id);
+      } else {
+        const signedPath = path.join(__dirname, 'uploads', `signed-${path.basename(doc.original_path)}`);
+        fs.writeFileSync(signedPath, signedPdfBytes);
+        db.prepare(`
+          UPDATE documents SET status = 'completed', signed_path = ?, completed_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(signedPath, doc.id);
+      }
 
       // Send completion emails to all parties
       const updatedSigners = db.prepare('SELECT * FROM signers WHERE document_id = ?').all(doc.id);
@@ -231,10 +296,25 @@ app.get('/api/documents/:id/download', (req, res) => {
   const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(req.params.id);
   if (!doc) return res.status(404).json({ error: 'Document not found' });
 
-  const filePath = doc.signed_path || doc.original_path;
-  res.download(filePath, `${doc.title}${doc.signed_path ? '-signed' : ''}.pdf`);
+  if (isVercel) {
+    const data = doc.signed_data || doc.file_data;
+    if (!data) return res.status(404).json({ error: 'File not found' });
+    const buffer = Buffer.from(data, 'base64');
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Disposition', `attachment; filename="${doc.title}${doc.signed_data ? '-signed' : ''}.pdf"`);
+    res.send(buffer);
+  } else {
+    const filePath = doc.signed_path || doc.original_path;
+    res.download(filePath, `${doc.title}${doc.signed_path ? '-signed' : ''}.pdf`);
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`DocSign server running on http://localhost:${PORT}`);
-});
+// Only start listening in non-Vercel (local dev)
+if (!isVercel) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`DocSign server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
